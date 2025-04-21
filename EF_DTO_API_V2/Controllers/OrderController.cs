@@ -6,7 +6,7 @@ namespace EF_DTO_API_V2.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    [ResponseCache(Duration = 300, Location = ResponseCacheLocation.Any)]
+    [ResponseCache(Duration = 200, Location = ResponseCacheLocation.Any)]
     public class OrderController : ControllerBase
     {
         private readonly IOrderService _orderService;
