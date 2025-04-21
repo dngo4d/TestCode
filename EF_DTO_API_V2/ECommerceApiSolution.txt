@@ -1,0 +1,1271 @@
+# ECommerceApiSolution
+Write C# code for the User, Company, Product, Order and OrderDetails CRUD Open API using .Net Core, EF, DTO, Stored Procedure, oAuth2 token, service and SQL Database connection>
+Product listing should be cache and also use HTTPResponseCache. 
+Please also include NUnit test cases ans console program to consume these APIs.
+## Project Structure
+
+```
+ECommerceApi/
+├── ECommerceApi.Web/
+│   ├── Controllers/
+│   ├── DTOs/
+│   ├── Models/
+│   ├── Services/
+│   ├── Program.cs
+├── ECommerceApi.Tests/
+│   ├── UnitTests/
+├── ECommerceApi.Client/
+│   ├── Program.cs
+├── SQL/
+│   ├── Tables.sql
+│   ├── StoredProcedures.sql
+```
+
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=.;Database=ECommerce;Trusted_Connection=True;"
+  },
+  "Authentication": {
+    "Issuer": "https://localhost:5001",
+    "Audience": "your-api",
+    "JwtKey": "your-very-secure-key-with-at-least-32-characters",
+    "ClientId": "your-client-id",
+    "ClientSecret": "your-client-secret"
+  }
+}
+
+
+## ECommerceApi.Web
+
+### Models
+
+```csharp
+// User.cs
+public class User
+{
+    public int Id { get; set; }
+    public string Username { get; set; }
+    public string Email { get; set; }
+    public int CompanyId { get; set; }
+    public Company Company { get; set; }
+}
+
+// Company.cs
+public class Company
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public ICollection<User> Users { get; set; }
+    public ICollection<Product> Products { get; set; }
+}
+
+// Product.cs
+public class Product
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public decimal Price { get; set; }
+    public int CompanyId { get; set; }
+    public Company Company { get; set; }
+}
+
+// Order.cs
+public class Order
+{
+    public int Id { get; set; }
+    public int UserId { get; set; }
+    public User User { get; set; }
+    public DateTime OrderDate { get; set; }
+    public decimal TotalCost { get; set; }
+    public ICollection<OrderDetail> OrderDetails { get; set; }
+}
+
+// OrderDetail.cs
+public class OrderDetail
+{
+    public int Id { get; set; }
+    public int OrderId { get; set; }
+    public Order Order { get; set; }
+    public int ProductId { get; set; }
+    public Product Product { get; set; }
+    public int Quantity { get; set; }
+    public decimal TotalCost { get; set; } // Quantity * Product.Price
+}
+```
+
+### DTOs
+
+```csharp
+// UserDTO.cs
+public class UserDTO
+{
+    public int Id { get; set; }
+    public string Username { get; set; }
+    public string Email { get; set; }
+    public int CompanyId { get; set; }
+}
+
+// CompanyDTO.cs
+public class CompanyDTO
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+}
+
+// ProductDTO.cs
+public class ProductDTO
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public decimal Price { get; set; }
+    public int CompanyId { get; set; }
+}
+
+// OrderDTO.cs
+public class OrderDTO
+{
+    public int Id { get; set; }
+    public int UserId { get; set; }
+    public DateTime OrderDate { get; set; }
+    public decimal TotalCost { get; set; }
+}
+
+// OrderDetailDTO.cs
+public class OrderDetailDTO
+{
+    public int Id { get; set; }
+    public int OrderId { get; set; }
+    public int ProductId { get; set; }
+    public int Quantity { get; set; }
+    public decimal TotalCost { get; set; }
+}
+
+// TokenRequest.cs
+public class TokenRequest
+{
+    public string ClientId { get; set; }
+    public string ClientSecret { get; set; }
+    public string GrantType { get; set; }
+    public string Scope { get; set; }
+}
+
+// TokenResponse.cs
+public class TokenResponse
+{
+    public string AccessToken { get; set; }
+    public int ExpiresIn { get; set; }
+    public string TokenType { get; set; }
+}
+```
+
+### DbContext
+
+```csharp
+// AppDbContext.cs
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+    public DbSet<User> Users { get; set; }
+    public DbSet<Company> Companies { get; set; }
+    public DbSet<Product> Products { get; set; }
+    public DbSet<Order> Orders { get; set; }
+    public DbSet<OrderDetail> OrderDetails { get; set; }
+}
+```
+
+### Services
+
+```csharp
+// IProductService.cs
+public interface IProductService
+{
+    Task<List<ProductDTO>> GetAllAsync();
+    Task<ProductDTO> GetByIdAsync(int id);
+    Task<ProductDTO> CreateAsync(ProductDTO product);
+    Task UpdateAsync(int id, ProductDTO product);
+    Task DeleteAsync(int id);
+}
+
+// ProductService.cs
+public class ProductService : IProductService
+{
+    private readonly AppDbContext _context;
+    private readonly IMemoryCache _cache;
+    private readonly string _cacheKey = "ProductList";
+
+    public ProductService(AppDbContext context, IMemoryCache cache)
+    {
+        _context = context;
+        _cache = cache;
+    }
+
+    public async Task<List<ProductDTO>> GetAllAsync()
+    {
+        if (!_cache.TryGetValue(_cacheKey, out List<ProductDTO> products))
+        {
+            products = await _context.Products
+                .FromSqlRaw("EXEC sp_GetAllProducts")
+                .Select(p => new ProductDTO
+                {
+                    Id = p.Id,
+                    Name = p.Name,
+                    Price = p.Price,
+                    CompanyId = p.CompanyId
+                })
+                .ToListAsync();
+
+            var cacheOptions = new MemoryCacheEntryOptions()
+                .SetSlidingExpiration(TimeSpan.FromMinutes(30));
+            _cache.Set(_cacheKey, products, cacheOptions);
+        }
+        return products;
+    }
+
+    public async Task<ProductDTO> GetByIdAsync(int id)
+    {
+        var product = await _context.Products
+            .FromSqlRaw("EXEC sp_GetProductById @Id", new SqlParameter("@Id", id))
+            .Select(p => new ProductDTO
+            {
+                Id = p.Id,
+                Name = p.Name,
+                Price = p.Price,
+                CompanyId = p.CompanyId
+            })
+            .FirstOrDefaultAsync();
+
+        return product ?? throw new KeyNotFoundException("Product not found");
+    }
+
+    public async Task<ProductDTO> CreateAsync(ProductDTO product)
+    {
+        var parameters = new[]
+        {
+            new SqlParameter("@Name", product.Name),
+            new SqlParameter("@Price", product.Price),
+            new SqlParameter("@CompanyId", product.CompanyId)
+        };
+
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_CreateProduct @Name, @Price, @CompanyId", parameters);
+        _cache.Remove(_cacheKey);
+        return product;
+    }
+
+    public async Task UpdateAsync(int id, ProductDTO product)
+    {
+        var parameters = new[]
+        {
+            new SqlParameter("@Id", id),
+            new SqlParameter("@Name", product.Name),
+            new SqlParameter("@Price", product.Price),
+            new SqlParameter("@CompanyId", product.CompanyId)
+        };
+
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_UpdateProduct @Id, @Name, @Price, @CompanyId", parameters);
+        _cache.Remove(_cacheKey);
+    }
+
+    public async Task DeleteAsync(int id)
+    {
+        var parameter = new SqlParameter("@Id", id);
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_DeleteProduct @Id", parameter);
+        _cache.Remove(_cacheKey);
+    }
+}
+
+// IOrderService.cs
+public interface IOrderService
+{
+    Task<List<OrderDTO>> GetAllAsync();
+    Task<OrderDTO> GetByIdAsync(int id);
+    Task<OrderDTO> CreateAsync(OrderDTO order);
+    Task UpdateAsync(int id, OrderDTO order);
+    Task DeleteAsync(int id);
+}
+
+// OrderService.cs
+public class OrderService : IOrderService
+{
+    private readonly AppDbContext _context;
+
+    public OrderService(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<List<OrderDTO>> GetAllAsync()
+    {
+        return await _context.Orders
+            .FromSqlRaw("EXEC sp_GetAllOrders")
+            .Select(o => new OrderDTO
+            {
+                Id = o.Id,
+                UserId = o.UserId,
+                OrderDate = o.OrderDate,
+                TotalCost = o.TotalCost
+            })
+            .ToListAsync();
+    }
+
+    public async Task<OrderDTO> GetByIdAsync(int id)
+    {
+        var order = await _context.Orders
+            .FromSqlRaw("EXEC sp_GetOrderById @Id", new SqlParameter("@Id", id))
+            .Select(o => new OrderDTO
+            {
+                Id = o.Id,
+                UserId = o.UserId,
+                OrderDate = o.OrderDate,
+                TotalCost = o.TotalCost
+            })
+            .FirstOrDefaultAsync();
+
+        return order ?? throw new KeyNotFoundException("Order not found");
+    }
+
+    public async Task<OrderDTO> CreateAsync(OrderDTO order)
+    {
+        var parameters = new[]
+        {
+            new SqlParameter("@UserId", order.UserId),
+            new SqlParameter("@OrderDate", order.OrderDate),
+            new SqlParameter("@TotalCost", order.TotalCost)
+        };
+
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_CreateOrder @UserId, @OrderDate, @TotalCost", parameters);
+        return order;
+    }
+
+    public async Task UpdateAsync(int id, OrderDTO order)
+    {
+        var parameters = new[]
+        {
+            new SqlParameter("@Id", id),
+            new SqlParameter("@UserId", order.UserId),
+            new SqlParameter("@OrderDate", order.OrderDate),
+            new SqlParameter("@TotalCost", order.TotalCost)
+        };
+
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_UpdateOrder @Id, @UserId, @OrderDate, @TotalCost", parameters);
+    }
+
+    public async Task DeleteAsync(int id)
+    {
+        var parameter = new SqlParameter("@Id", id);
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_DeleteOrder @Id", parameter);
+    }
+}
+
+// IOrderDetailService.cs
+public interface IOrderDetailService
+{
+    Task<List<OrderDetailDTO>> GetAllAsync();
+    Task<OrderDetailDTO> GetByIdAsync(int id);
+    Task<OrderDetailDTO> CreateAsync(OrderDetailDTO orderDetail);
+    Task UpdateAsync(int id, OrderDetailDTO orderDetail);
+    Task DeleteAsync(int id);
+}
+
+// OrderDetailService.cs
+public class OrderDetailService : IOrderDetailService
+{
+    private readonly AppDbContext _context;
+
+    public OrderDetailService(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<List<OrderDetailDTO>> GetAllAsync()
+    {
+        return await _context.OrderDetails
+            .FromSqlRaw("EXEC sp_GetAllOrderDetails")
+            .Select(od => new OrderDetailDTO
+            {
+                Id = od.Id,
+                OrderId = od.OrderId,
+                ProductId = od.ProductId,
+                Quantity = od.Quantity,
+                TotalCost = od.TotalCost
+            })
+            .ToListAsync();
+    }
+
+    public async Task<OrderDetailDTO> GetByIdAsync(int id)
+    {
+        var orderDetail = await _context.OrderDetails
+            .FromSqlRaw("EXEC sp_GetOrderDetailById @Id", new SqlParameter("@Id", id))
+            .Select(od => new OrderDetailDTO
+            {
+                Id = od.Id,
+                OrderId = od.OrderId,
+                ProductId = od.ProductId,
+                Quantity = od.Quantity,
+                TotalCost = od.TotalCost
+            })
+            .FirstOrDefaultAsync();
+
+        return orderDetail ?? throw new KeyNotFoundException("OrderDetail not found");
+    }
+
+    public async Task<OrderDetailDTO> CreateAsync(OrderDetailDTO orderDetail)
+    {
+        // Calculate TotalCost (Quantity * Product.Price)
+        var product = await _context.Products.FindAsync(orderDetail.ProductId);
+        if (product == null) throw new KeyNotFoundException("Product not found");
+        orderDetail.TotalCost = orderDetail.Quantity * product.Price;
+
+        var parameters = new[]
+        {
+            new SqlParameter("@OrderId", orderDetail.OrderId),
+            new SqlParameter("@ProductId", orderDetail.ProductId),
+            new SqlParameter("@Quantity", orderDetail.Quantity),
+            new SqlParameter("@TotalCost", orderDetail.TotalCost)
+        };
+
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_CreateOrderDetail @OrderId, @ProductId, @Quantity, @TotalCost", parameters);
+
+        // Update Order TotalCost
+        await UpdateOrderTotalCost(orderDetail.OrderId);
+
+        return orderDetail;
+    }
+
+    public async Task UpdateAsync(int id, OrderDetailDTO orderDetail)
+    {
+        // Calculate TotalCost (Quantity * Product.Price)
+        var product = await _context.Products.FindAsync(orderDetail.ProductId);
+        if (product == null) throw new KeyNotFoundException("Product not found");
+        orderDetail.TotalCost = orderDetail.Quantity * product.Price;
+
+        var parameters = new[]
+        {
+            new SqlParameter("@Id", id),
+            new SqlParameter("@OrderId", orderDetail.OrderId),
+            new SqlParameter("@ProductId", orderDetail.ProductId),
+            new SqlParameter("@Quantity", orderDetail.Quantity),
+            new SqlParameter("@TotalCost", orderDetail.TotalCost)
+        };
+
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_UpdateOrderDetail @Id, @OrderId, @ProductId, @Quantity, @TotalCost", parameters);
+
+        // Update Order TotalCost
+        await UpdateOrderTotalCost(orderDetail.OrderId);
+    }
+
+    public async Task DeleteAsync(int id)
+    {
+        var orderDetail = await _context.OrderDetails.FindAsync(id);
+        if (orderDetail == null) throw new KeyNotFoundException("OrderDetail not found");
+
+        var parameter = new SqlParameter("@Id", id);
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_DeleteOrderDetail @Id", parameter);
+
+        // Update Order TotalCost
+        await UpdateOrderTotalCost(orderDetail.OrderId);
+    }
+
+    private async Task UpdateOrderTotalCost(int orderId)
+    {
+        var totalCost = await _context.OrderDetails
+            .Where(od => od.OrderId == orderId)
+            .SumAsync(od => od.TotalCost);
+
+        var parameters = new[]
+        {
+            new SqlParameter("@Id", orderId),
+            new SqlParameter("@TotalCost", totalCost)
+        };
+
+        await _context.Database.ExecuteSqlRawAsync("EXEC sp_UpdateOrderTotalCost @Id, @TotalCost", parameters);
+    }
+}
+```
+
+### Controllers
+
+```csharp
+// ProductController.cs
+[Route("api/[controller]")]
+[ApiController]
+[Authorize]
+[ResponseCache(Duration = 300, Location = ResponseCacheLocation.Any)]
+public class ProductController : ControllerBase
+{
+    private readonly IProductService _productService;
+
+    public ProductController(IProductService productService)
+    {
+        _productService = productService;
+    }
+
+    [HttpGet]
+    public async Task<ActionResult<List<ProductDTO>>> GetAll()
+    {
+        return Ok(await _productService.GetAllAsync());
+    }
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<ProductDTO>> Get(int id)
+    {
+        try
+        {
+            return Ok(await _productService.GetByIdAsync(id));
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+
+    [HttpPost]
+    public async Task<ActionResult<ProductDTO>> Create(ProductDTO product)
+    {
+        var created = await _productService.CreateAsync(product);
+        return CreatedAtAction(nameof(Get), new { id = created.Id }, created);
+    }
+
+    [HttpPut("{id}")]
+    public async Task<IActionResult> Update(int id, ProductDTO product)
+    {
+        try
+        {
+            await _productService.UpdateAsync(id, product);
+            return NoContent();
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Delete(int id)
+    {
+        try
+        {
+            await _productService.DeleteAsync(id);
+            return NoContent();
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+}
+
+// OrderController.cs
+[Route("api/[controller]")]
+[ApiController]
+[Authorize]
+public class OrderController : ControllerBase
+{
+    private readonly IOrderService _orderService;
+
+    public OrderController(IOrderService orderService)
+    {
+        _orderService = orderService;
+    }
+
+    [HttpGet]
+    public async Task<ActionResult<List<OrderDTO>>> GetAll()
+    {
+        return Ok(await _orderService.GetAllAsync());
+    }
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<OrderDTO>> Get(int id)
+    {
+        try
+        {
+            return Ok(await _orderService.GetByIdAsync(id));
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+
+    [HttpPost]
+    public async Task<ActionResult<OrderDTO>> Create(OrderDTO order)
+    {
+        var created = await _orderService.CreateAsync(order);
+        return CreatedAtAction(nameof(Get), new { id = created.Id }, created);
+    }
+
+    [HttpPut("{id}")]
+    public async Task<IActionResult> Update(int id, OrderDTO order)
+    {
+        try
+        {
+            await _orderService.UpdateAsync(id, order);
+            return NoContent();
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Delete(int id)
+    {
+        try
+        {
+            await _orderService.DeleteAsync(id);
+            return NoContent();
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+}
+
+// OrderDetailController.cs
+[Route("api/[controller]")]
+[ApiController]
+[Authorize]
+public class OrderDetailController : ControllerBase
+{
+    private readonly IOrderDetailService _orderDetailService;
+
+    public OrderDetailController(IOrderDetailService orderDetailService)
+    {
+        _orderDetailService = orderDetailService;
+    }
+
+    [HttpGet]
+    public async Task<ActionResult<List<OrderDetailDTO>>> GetAll()
+    {
+        return Ok(await _orderDetailService.GetAllAsync());
+    }
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<OrderDetailDTO>> Get(int id)
+    {
+        try
+        {
+            return Ok(await _orderDetailService.GetByIdAsync(id));
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+
+    [HttpPost]
+    public async Task<ActionResult<OrderDetailDTO>> Create(OrderDetailDTO orderDetail)
+    {
+        try
+        {
+            var created = await _orderDetailService.CreateAsync(orderDetail);
+            return CreatedAtAction(nameof(Get), new { id = created.Id }, created);
+        }
+        catch (KeyNotFoundException ex)
+        {
+            return BadRequest(ex.Message);
+        }
+    }
+
+    [HttpPut("{id}")]
+    public async Task<IActionResult> Update(int id, OrderDetailDTO orderDetail)
+    {
+        try
+        {
+            await _orderDetailService.UpdateAsync(id, orderDetail);
+            return NoContent();
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Delete(int id)
+    {
+        try
+        {
+            await _orderDetailService.DeleteAsync(id);
+            return NoContent();
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+}
+
+// TokenController.cs
+[Route("api/[controller]")]
+[ApiController]
+public class TokenController : ControllerBase
+{
+    private readonly IConfiguration _configuration;
+
+    public TokenController(IConfiguration configuration)
+    {
+        _configuration = configuration;
+    }
+
+    [HttpPost]
+    public IActionResult GetToken([FromBody] TokenRequest request)
+    {
+        // Simplified token generation - in production, use a proper Identity Provider
+        if (request.GrantType != "client_credentials" ||
+            request.ClientId != _configuration["Authentication:ClientId"] ||
+            request.ClientSecret != _configuration["Authentication:ClientSecret"])
+        {
+            return Unauthorized();
+        }
+
+        var token = GenerateJwtToken();
+        return Ok(new TokenResponse
+        {
+            AccessToken = token,
+            ExpiresIn = 120, // 2 minutes
+            TokenType = "Bearer"
+        });
+    }
+
+    private string GenerateJwtToken()
+    {
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Authentication:JwtKey"]));
+        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+        var token = new JwtSecurityToken(
+            issuer: _configuration["Authentication:Issuer"],
+            audience: _configuration["Authentication:Audience"],
+            expires: DateTime.Now.AddSeconds(120), // 2 minutes
+            signingCredentials: creds
+        );
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+}
+```
+
+### Program.cs (.NET 8)
+
+```csharp
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+builder.Services.AddMemoryCache();
+builder.Services.AddResponseCaching();
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = builder.Configuration["Authentication:Issuer"],
+            ValidAudience = builder.Configuration["Authentication:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(builder.Configuration["Authentication:JwtKey"]))
+        };
+    });
+
+builder.Services.AddSwaggerGen();
+builder.Services.AddScoped<IProductService, ProductService>();
+builder.Services.AddScoped<IOrderService, OrderService>();
+builder.Services.AddScoped<IOrderDetailService, OrderDetailService>();
+
+var app = builder.Build();
+
+app.UseResponseCaching();
+app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+app.UseSwagger();
+app.UseSwaggerUI();
+
+app.Run();
+```
+
+## SQL Scripts
+
+### Tables.sql
+
+```sql
+--CREATE TABLE Companies (
+--    Id INT PRIMARY KEY IDENTITY,
+--    CompanyName NVARCHAR(100),
+--	CompanyType nvarchar(50),
+--	Email NVARCHAR(100),
+--	Phone nvarchar(50),
+--	ModifiedDate datetime
+--);
+
+--CREATE TABLE Users (
+--    Id INT PRIMARY KEY IDENTITY,
+--    Username NVARCHAR(50),
+--	Passwod nvarchar(100),
+--    Email NVARCHAR(100),
+--	Phone nvarchar(50),
+--    CompanyId INT,
+--	ModifiedDate datetime
+    
+--);
+
+--CREATE TABLE Products (
+--    Id INT PRIMARY KEY IDENTITY,
+--    ProductName NVARCHAR(100),
+--	ProductType nvarchar(50),
+--	ProductStatus nvarchar(50),
+--    Price DECIMAL(18,2),
+--	Quantity int,
+--    CompanyId INT,
+--	ModifiedDate datetime
+    
+--);
+
+--CREATE TABLE Orders (
+--    Id INT PRIMARY KEY IDENTITY,
+--    UserId INT,
+--	CompanyId int,
+--	OrderName nvarchar(100),
+--    OrderDate DATETIME,
+--    TotalCost DECIMAL(18,2),
+--	OrderStatus nvarchar(50),
+--	ModifiedDate datetime
+    
+--);
+
+--CREATE TABLE OrderDetails (
+--    Id INT PRIMARY KEY IDENTITY,
+--    OrderId INT,
+--    ProductName nvarchar(100),
+--    Quantity INT,
+--    TotalCost DECIMAL(18,2),
+--	ModifiedDate datetime,
+    
+--);
+```
+INSERT INTO [dbo].[Companies]
+           ([CompanyName]
+           ,[CompanyType]
+           ,[Email]
+           ,[Phone]
+           ,[ModifiedDate])
+     VALUES
+           ('Amazon'
+           ,'Vendor'
+           ,'cust@amazon.com'
+           ,'313-555-1212'
+           ,'2025-04-19')
+GO
+
+-- Insert data into Users table
+INSERT INTO Users (Username, Email, CompanyId) VALUES
+('johndoe', 'john.doe@email.com', 1),
+('janesmith', 'jane.smith@email.com', 2),
+('alicej', 'alice.j@email.com', 1),
+('bobbrown', 'bob.brown@email.com', 3);
+
+-- Insert data into Products table
+INSERT INTO Products (Name, Price, CompanyId) VALUES
+('Wireless Mouse', 25.99, 1),
+('USB-C Cable', 12.50, 1),
+('Bluetooth Speaker', 49.99, 2),
+('Laptop Stand', 35.00, 2),
+('External HDD', 89.99, 3);
+
+-- Insert data into Orders table
+INSERT INTO Orders (UserId, OrderDate, TotalCost) VALUES
+(1, '2025-04-01 10:00:00', 63.48),
+(2, '2025-04-02 12:30:00', 134.98),
+(3, '2025-04-03 15:45:00', 25.99),
+(4, '2025-04-04 09:15:00', 179.98);
+
+-- Insert data into OrderDetails table
+INSERT INTO OrderDetails (OrderId, ProductId, Quantity, TotalCost) VALUES
+(1, 1, 1, 25.99),
+(1, 2, 3, 37.50),
+(2, 3, 2, 99.98),
+(2, 4, 1, 35.00),
+(3, 1, 1, 25.99),
+(4, 5, 2, 179.98);
+
+
+### StoredProcedures.sql
+
+```sql
+CREATE PROCEDURE sp_GetAllProducts
+AS
+BEGIN
+    SELECT * FROM Products
+END
+
+CREATE PROCEDURE sp_GetProductById
+    @Id INT
+AS
+BEGIN
+    SELECT * FROM Products WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_CreateProduct
+    @Name NVARCHAR(100),
+    @Price DECIMAL(18,2),
+    @CompanyId INT
+AS
+BEGIN
+    INSERT INTO Products (Name, Price, CompanyId)
+    VALUES (@Name, @Price, @CompanyId)
+END
+
+CREATE PROCEDURE sp_UpdateProduct
+    @Id INT,
+    @Name NVARCHAR(100),
+    @Price DECIMAL(18,2),
+    @CompanyId INT
+AS
+BEGIN
+    UPDATE Products
+    SET Name = @Name, Price = @Price, CompanyId = @CompanyId
+    WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_DeleteProduct
+    @Id INT
+AS
+BEGIN
+    DELETE FROM Products WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_GetAllOrders
+AS
+BEGIN
+    SELECT * FROM Orders
+END
+
+CREATE PROCEDURE sp_GetOrderById
+    @Id INT
+AS
+BEGIN
+    SELECT * FROM Orders WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_CreateOrder
+    @UserId INT,
+    @OrderDate DATETIME,
+    @TotalCost DECIMAL(18,2)
+AS
+BEGIN
+    INSERT INTO Orders (UserId, OrderDate, TotalCost)
+    VALUES (@UserId, @OrderDate, @TotalCost)
+END
+
+CREATE PROCEDURE sp_UpdateOrder
+    @Id INT,
+    @UserId INT,
+    @OrderDate DATETIME,
+    @TotalCost DECIMAL(18,2)
+AS
+BEGIN
+    UPDATE Orders
+    SET UserId = @UserId, OrderDate = @OrderDate, TotalCost = @TotalCost
+    WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_DeleteOrder
+    @Id INT
+AS
+BEGIN
+    DELETE FROM Orders WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_GetAllOrderDetails
+AS
+BEGIN
+    SELECT * FROM OrderDetails
+END
+
+CREATE PROCEDURE sp_GetOrderDetailById
+    @Id INT
+AS
+BEGIN
+    SELECT * FROM OrderDetails WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_CreateOrderDetail
+    @OrderId INT,
+    @ProductId INT,
+    @Quantity INT,
+    @TotalCost DECIMAL(18,2)
+AS
+BEGIN
+    INSERT INTO OrderDetails (OrderId, ProductId, Quantity, TotalCost)
+    VALUES (@OrderId, @ProductId, @Quantity, @TotalCost)
+END
+
+CREATE PROCEDURE sp_UpdateOrderDetail
+    @Id INT,
+    @OrderId INT,
+    @ProductId INT,
+    @Quantity INT,
+    @TotalCost DECIMAL(18,2)
+AS
+BEGIN
+    UPDATE OrderDetails
+    SET OrderId = @OrderId, ProductId = @ProductId, Quantity = @Quantity, TotalCost = @TotalCost
+    WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_DeleteOrderDetail
+    @Id INT
+AS
+BEGIN
+    DELETE FROM OrderDetails WHERE Id = @Id
+END
+
+CREATE PROCEDURE sp_UpdateOrderTotalCost
+    @Id INT,
+    @TotalCost DECIMAL(18,2)
+AS
+BEGIN
+    UPDATE Orders
+    SET TotalCost = @TotalCost
+    WHERE Id = @Id
+END
+```
+
+## ECommerceApi.Tests
+
+### ProductServiceTests.cs
+
+```csharp
+public class ProductServiceTests
+{
+    private readonly AppDbContext _context;
+    private readonly IMemoryCache _cache;
+    private readonly ProductService _service;
+
+    public ProductServiceTests()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        _context = new AppDbContext(options);
+        _cache = new MemoryCache(new MemoryCacheOptions());
+        _service = new ProductService(_context, _cache);
+    }
+
+    [Test]
+    public async Task GetAllAsync_ReturnsProducts()
+    {
+        var product = new Product { Id = 1, Name = "Test", Price = 10.0m, CompanyId = 1 };
+        _context.Products.Add(product);
+        await _context.SaveChangesAsync();
+
+        var result = await _service.GetAllAsync();
+
+        Assert.IsNotEmpty(result);
+        Assert.AreEqual(1, result.Count);
+    }
+
+    [Test]
+    public async Task CreateAsync_AddsProduct()
+    {
+        var productDTO = new ProductDTO { Name = "Test", Price = 10.0m, CompanyId = 1 };
+
+        var result = await _service.CreateAsync(productDTO);
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual(productDTO.Name, result.Name);
+    }
+}
+
+// OrderDetailServiceTests.cs
+public class OrderDetailServiceTests
+{
+    private readonly AppDbContext _context;
+    private readonly OrderDetailService _service;
+
+    public OrderDetailServiceTests()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        _context = new AppDbContext(options);
+        _service = new OrderDetailService(_context);
+    }
+
+    [Test]
+    public async Task CreateAsync_AddsOrderDetail()
+    {
+        var product = new Product { Id = 1, Name = "Test", Price = 10.0m, CompanyId = 1 };
+        var order = new Order { Id = 1, UserId = 1, OrderDate = DateTime.Now, TotalCost = 0 };
+        _context.Products.Add(product);
+        _context.Orders.Add(order);
+        await _context.SaveChangesAsync();
+
+        var orderDetailDTO = new OrderDetailDTO { OrderId = 1, ProductId = 1, Quantity = 2 };
+
+        var result = await _service.CreateAsync(orderDetailDTO);
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual(20.0m, result.TotalCost); // 2 * 10.0
+    }
+
+    [Test]
+    public async Task GetAllAsync_ReturnsOrderDetails()
+    {
+        var orderDetail = new OrderDetail { Id = 1, OrderId = 1, ProductId = 1, Quantity = 2, TotalCost = 20.0m };
+        _context.OrderDetails.Add(orderDetail);
+        await _context.SaveChangesAsync();
+
+        var result = await _service.GetAllAsync();
+
+        Assert.IsNotEmpty(result);
+        Assert.AreEqual(1, result.Count);
+    }
+}
+```
+
+## ECommerceApi.Client
+
+### Program.cs
+
+```csharp
+public class Program
+{
+    private static readonly HttpClient _client = new HttpClient();
+
+    public static async Task Main()
+    {
+        var token = await GetTokenAsync();
+        _client.DefaultRequestHeaders.Authorization = 
+            new AuthenticationHeaderValue("Bearer", token);
+
+        // Create a product
+        var product = new ProductDTO { Name = "Laptop", Price = 999.99m, CompanyId = 1 };
+        var productResponse = await _client.PostAsJsonAsync("https://localhost:5001/api/product", product);
+        var createdProduct = await productResponse.Content.ReadFromJsonAsync<ProductDTO>();
+        Console.WriteLine($"Created Product: {createdProduct.Name}");
+
+        // Create an order
+        var order = new OrderDTO { UserId = 1, OrderDate = DateTime.Now, TotalCost = 0 };
+        var orderResponse = await _client.PostAsJsonAsync("https://localhost:5001/api/order", order);
+        var createdOrder = await orderResponse.Content.ReadFromJsonAsync<OrderDTO>();
+        Console.WriteLine($"Created Order: {createdOrder.Id}");
+
+        // Create an order detail
+        var orderDetail = new OrderDetailDTO { OrderId = createdOrder.Id, ProductId = createdProduct.Id, Quantity = 2 };
+        var orderDetailResponse = await _client.PostAsJsonAsync("https://localhost:5001/api/orderdetail", orderDetail);
+        var createdOrderDetail = await orderDetailResponse.Content.ReadFromJsonAsync<OrderDetailDTO>();
+        Console.WriteLine($"Created OrderDetail: {createdOrderDetail.Id} with TotalCost: ${createdOrderDetail.TotalCost}");
+
+        // Get products
+        var productsResponse = await _client.GetAsync("https://localhost:5001/api/product");
+        var products = await productsResponse.Content.ReadFromJsonAsync<List<ProductDTO>>();
+        Console.WriteLine("Products:");
+        products.ForEach(p => Console.WriteLine($"{p.Name}: ${p.Price}"));
+
+        // Get order details
+        var orderDetailsResponse = await _client.GetAsync("https://localhost:5001/api/orderdetail");
+        var orderDetails = await orderDetailsResponse.Content.ReadFromJsonAsync<List<OrderDetailDTO>>();
+        Console.WriteLine("Order Details:");
+        orderDetails.ForEach(od => Console.WriteLine($"Order {od.OrderId}, Product {od.ProductId}, Total: ${od.TotalCost}"));
+    }
+
+    private static async Task<string> GetTokenAsync()
+    {
+        var tokenRequest = new TokenRequest
+        {
+            GrantType = "client_credentials",
+            ClientId = "your-client-id",
+            ClientSecret = "your-client-secret",
+            Scope = "your-api"
+        };
+
+        var response = await _client.PostAsJsonAsync("https://localhost:5001/api/token", tokenRequest);
+        var tokenResponse = await response.Content.ReadFromJsonAsync<TokenResponse>();
+        return tokenResponse.AccessToken;
+    }
+}
+```
+
+## appsettings.json
+
+```json
+```
+
+## Notes
+
+ 1. Added `TokenController` to issue JWT tokensWITH a 2-minute expiration.
+ 2. Implemented complete CRUD operations for `OrderDetail` with `OrderDetailService` and `OrderDetailController`.
+ 3. `OrderDetailService` calculates `TotalCost` (Quantity \* Product.Price) and updates `Order.TotalCost` after create/update/delete operations.
+ 4. Updated SQL stored procedures to include `OrderDetail` operations and `sp_UpdateOrderTotalCost`.
+ 5. Updated client `Program.cs` to use the new `/api/token` endpoint and demonstrate `OrderDetail` creation.
+ 6. Added unit tests for `OrderDetailService`.
+ 7. Maintained in-memory caching for product listing and HTTP response caching.
+ 8. Replace `JwtKey`, `ClientId`, and `ClientSecret` in `appsettings.json` with secure values.
+ 9. The token endpoint is simplified; in production, use a proper identity provider like IdentityServer or Auth0.
+10. Add error handling, validation, and remaining services/controllers as needed.
+
+To run:
+
+1. Set up SQL Server and run SQL scripts.
+2. Update `appsettings.json` with secure authentication values.
+3. Run the Web API.
+4. Run tests.
+5. Run the console client.
+
+using (var command = context.Database.GetDbConnection().CreateCommand())
+{
+    command.CommandText = "EXEC GetOrdersAndOrderItems"; // Your stored proc name
+    command.CommandType = CommandType.Text;
+
+    await context.Database.OpenConnectionAsync();
+
+    using (var reader = await command.ExecuteReaderAsync())
+    {
+        var orders = new List<Order>();
+        var orderItems = new List<OrderItem>();
+
+        // First result set: Orders
+        while (await reader.ReadAsync())
+        {
+            orders.Add(new Order
+            {
+                Id = reader.GetInt32(0),
+                CustomerName = reader.GetString(1)
+                // Map other fields
+            });
+        }
+
+        // Move to next result set
+        await reader.NextResultAsync();
+
+        // Second result set: OrderItems
+        while (await reader.ReadAsync())
+        {
+            orderItems.Add(new OrderItem
+            {
+                Id = reader.GetInt32(0),
+                OrderId = reader.GetInt32(1),
+                Product = reader.GetString(2),
+                Quantity = reader.GetInt32(3)
+                // Map other fields
+            });
+        }
+
+        // Use your results (e.g., combine them)
+    }
+}
